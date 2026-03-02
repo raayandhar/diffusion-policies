@@ -23,7 +23,11 @@ from shared.utils.normalize_util import get_image_range_normalizer
 from shared.utils.pytorch_util import dict_apply
 from shared.utils.replay_buffer import ReplayBuffer
 from shared.utils.sampler import SequenceSampler, get_val_mask, downsample_mask
-from shared.env.merlin.se3_utils import absolute_to_relative
+from shared.env.merlin.se3_utils import (
+    ACTION_REPR_ARM_REL_HAND_REL,
+    absolute_to_relative,
+    validate_action_representation,
+)
 
 
 # # NOTE(raayan)
@@ -92,10 +96,12 @@ class MerlinImageDataset(Dataset):
         max_train_episodes: int = None,
         first_cut: int = 0,
         encoder_window: int = 0,
+        action_representation: str = ACTION_REPR_ARM_REL_HAND_REL,
     ):
         super().__init__()
 
         assert os.path.isdir(dataset_path), f"Dataset path does not exist: {dataset_path}"
+        action_representation = validate_action_representation(action_representation)
 
         replay_buffer = None
         if use_cache:
@@ -106,6 +112,7 @@ class MerlinImageDataset(Dataset):
                 "shape_meta": OmegaConf.to_container(shape_meta),
                 "first_cut": int(first_cut),
                 "encoder_window": int(encoder_window),
+                "action_representation": action_representation,
             }
             cache_hash = hashlib.md5(
                 json.dumps(cache_key, sort_keys=True).encode("utf-8")
@@ -210,6 +217,7 @@ class MerlinImageDataset(Dataset):
         self.pad_after = pad_after
         self.first_cut = int(first_cut)
         self.encoder_window = int(encoder_window)
+        self.action_representation = action_representation
 
         print(
             "[MerlinImageDataset] Replay buffer: "
@@ -259,14 +267,19 @@ class MerlinImageDataset(Dataset):
         # # the function is very similar. We do this in get_normalizer() because it integrates directly
         # # with the training code.
 
-        print("[MerlinImageDataset] Computing relative action normalization stats...")
+        print(
+            "[MerlinImageDataset] Computing action normalization stats "
+            f"(action_representation={self.action_representation})..."
+        )
         all_relative = []
         for idx in range(len(self.sampler)):
             data = self.sampler.sample_sequence(idx)
             abs_action = data["action"].astype(np.float32)
             if self.num_latency_steps > 0:
                 abs_action = abs_action[self.num_latency_steps:]
-            relative = absolute_to_relative(abs_action)
+            relative = absolute_to_relative(
+                abs_action, action_representation=self.action_representation
+            )
             all_relative.append(relative)
         all_relative = np.concatenate(all_relative, axis=0)
         normalizer["action"] = SingleFieldLinearNormalizer.create_fit(all_relative, mode="gaussian")
@@ -309,15 +322,17 @@ class MerlinImageDataset(Dataset):
             obs_dict[key] = lowdim_obs
             del data[key]
 
-        # # Convert absolute actions to relative:
-        # # arm (first 6D) via SE(3), hand (last 6D) via subtraction
+        # # Convert absolute actions into model targets according to action_representation.
+        # # Arm (first 6D) is always SE(3)-relative; hand behavior is mode-dependent.
         abs_action = data["action"].astype(np.float32)
         # # We should never be hitting this case in MERLIN actually
         if self.num_latency_steps > 0:
             # # Log if we hit this case.
             print(f"[MerlinImageDataset] hit self.num_latency_steps > 0; l296")
             abs_action = abs_action[self.num_latency_steps:]
-        action = absolute_to_relative(abs_action)
+        action = absolute_to_relative(
+            abs_action, action_representation=self.action_representation
+        )
 
         torch_data = {
             "obs": dict_apply(obs_dict, torch.from_numpy),

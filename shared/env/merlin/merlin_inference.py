@@ -8,7 +8,11 @@ import hydra
 import numpy as np
 import torch
 
-from shared.env.merlin.se3_utils import relative_to_absolute
+from shared.env.merlin.se3_utils import (
+    ACTION_REPR_ARM_REL_HAND_REL,
+    relative_to_absolute,
+    validate_action_representation,
+)
 
 
 # # NOTE(raayan)
@@ -20,7 +24,7 @@ class MerlinPolicyInference:
     Lightweight MERLIN policy inference wrapper.
     
     Currently:
-    image -> model -> relative actions -> + current state -> absolute actions
+    image -> model -> mode-aware actions -> + current state -> absolute actions
     """
     def __init__(
         self,
@@ -29,6 +33,7 @@ class MerlinPolicyInference:
         use_ema: bool = True,
         num_inference_steps: Optional[int] = None,
         action_mode: str = "first",
+        action_representation: Optional[str] = None,
     ):
         if action_mode not in {"first", "chunk", "all"}:
             raise ValueError(
@@ -65,6 +70,9 @@ class MerlinPolicyInference:
 
         self.shape_meta = self._resolve_shape_meta(cfg)
         self._validate_shape_meta(self.shape_meta)
+        self.action_representation = self._resolve_action_representation(
+            cfg, action_representation
+        )
 
         self.rgb_key = "camera_0"
         self.expected_chw = tuple(self.shape_meta["obs"][self.rgb_key]["shape"])
@@ -92,9 +100,9 @@ class MerlinPolicyInference:
                          actions back to absolute.
         Returns:
             Dict with absolute action outputs and metadata.
-            NOTE: the model is expected to predict *relative* outputs.
-                  We convert them to absolute outputs using current robot state
-                  which is passed into the prediction.
+            NOTE: arm outputs are expected to be relative; hand outputs are
+                  interpreted using action_representation. We convert everything
+                  to absolute outputs using current robot state.
         """
         if not isinstance(robot_state, np.ndarray):
             robot_state = np.asarray(robot_state, dtype=np.float32)
@@ -156,13 +164,21 @@ class MerlinPolicyInference:
             result = self.policy.predict_action(obs_torch)
         latency = time.time() - t0
 
-        # # Model outputs are unnormalized *relative* actions.
+        # # Model outputs are unnormalized action targets in configured representation.
         rel_action_chunk = result["action"][0].detach().cpu().numpy().astype(np.float32)
         rel_action_pred = result["action_pred"][0].detach().cpu().numpy().astype(np.float32)
 
-        # # Convert relative -> absolute using current robot state.
-        action_chunk = relative_to_absolute(rel_action_chunk, robot_state)
-        action_pred = relative_to_absolute(rel_action_pred, robot_state)
+        # # Convert model output -> absolute using current robot state.
+        action_chunk = relative_to_absolute(
+            rel_action_chunk,
+            robot_state,
+            action_representation=self.action_representation,
+        )
+        action_pred = relative_to_absolute(
+            rel_action_pred,
+            robot_state,
+            action_representation=self.action_representation,
+        )
 
         output: Dict[str, object] = {
             "latency_sec": float(latency),
@@ -193,6 +209,21 @@ class MerlinPolicyInference:
         raise ValueError(
             "Could not find shape_meta in cfg. Checked cfg.shape_meta, cfg.tasks.shape_meta, cfg.task.shape_meta."
         )
+
+    @staticmethod
+    def _resolve_action_representation(cfg, override: Optional[str]) -> str:
+        if override is not None:
+            return validate_action_representation(override)
+
+        # Prefer task dataset config so saved checkpoints stay self-describing.
+        action_representation = ACTION_REPR_ARM_REL_HAND_REL
+        if hasattr(cfg, "tasks") and hasattr(cfg.tasks, "dataset"):
+            action_representation = getattr(
+                cfg.tasks.dataset,
+                "action_representation",
+                ACTION_REPR_ARM_REL_HAND_REL,
+            )
+        return validate_action_representation(action_representation)
 
     @staticmethod
     def _validate_shape_meta(shape_meta: dict) -> None:

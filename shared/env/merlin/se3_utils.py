@@ -8,6 +8,24 @@ from scipy.spatial.transform import Rotation as R
 # # Credit: dexumi/common/utility/matrix.py
 # # https://github.com/real-stanford/DexUMI/blob/main/dexumi/common/utility/matrix.py
 
+ACTION_REPR_ARM_REL_HAND_REL = "arm_rel_hand_rel"
+ACTION_REPR_ARM_REL_HAND_ABS = "arm_rel_hand_abs"
+SUPPORTED_ACTION_REPRESENTATIONS = {
+    ACTION_REPR_ARM_REL_HAND_REL,
+    ACTION_REPR_ARM_REL_HAND_ABS,
+}
+
+
+def validate_action_representation(action_representation: str) -> str:
+    action_representation = str(action_representation)
+    if action_representation not in SUPPORTED_ACTION_REPRESENTATIONS:
+        raise ValueError(
+            "Unsupported action_representation "
+            f"'{action_representation}'. Supported values: "
+            f"{sorted(SUPPORTED_ACTION_REPRESENTATIONS)}."
+        )
+    return action_representation
+
 
 def vec6dof_to_homogeneous_matrix(vec6: np.ndarray) -> np.ndarray:
     """Convert a 6-DOF vector [x, y, z, rx, ry, rz] to a 4x4 homogeneous matrix."""
@@ -42,18 +60,24 @@ def homogeneous_matrix_to_6dof(T: np.ndarray) -> np.ndarray:
 
 
 
-def absolute_to_relative(abs_actions: np.ndarray) -> np.ndarray:
+def absolute_to_relative(
+    abs_actions: np.ndarray,
+    action_representation: str = ACTION_REPR_ARM_REL_HAND_REL,
+) -> np.ndarray:
     """
-    Convert a sequence of absolute 12D actions to relative.
+    Convert a sequence of absolute 12D actions to model target actions.
 
     Args:
         abs_actions: [T, 12] absolute actions where [:, :6] is arm SE(3) pose
                      and [:, 6:] is hand encoder readings.
+        action_representation:
+            - arm_rel_hand_rel: arm is relative, hand is relative.
+            - arm_rel_hand_abs: arm is relative, hand stays absolute.
 
     Returns:
-        [T, 12] relative actions. Arm uses SE(3) relative transform from
-        the first timestep; hand uses simple subtraction.
+        [T, 12] transformed actions for model training targets.
     """
+    action_representation = validate_action_representation(action_representation)
 
     # # in __getitem__ in MerlinImageDataset we run action = absolute_to_relative(abs_action)
     # # per sample, we load the absolute action sequence ([T, 12])
@@ -75,26 +99,37 @@ def absolute_to_relative(abs_actions: np.ndarray) -> np.ndarray:
         T_rel = relative_transformation(T0, Tt)
         arm_rel[i] = homogeneous_matrix_to_6dof(T_rel)
 
-    # # For each timestep t, h_rel(t) = h(t) - h(0)
-    hand_rel = hand_abs - hand_abs[0:1]
+    if action_representation == ACTION_REPR_ARM_REL_HAND_REL:
+        # # For each timestep t, h_rel(t) = h(t) - h(0)
+        hand_target = hand_abs - hand_abs[0:1]
+    else:
+        # # Keep hand outputs in absolute space.
+        hand_target = hand_abs
 
     # # Return transformed data
-    return np.concatenate([arm_rel, hand_rel], axis=-1).astype(np.float32)
+    return np.concatenate([arm_rel, hand_target], axis=-1).astype(np.float32)
 
 
 def relative_to_absolute(
-    rel_actions: np.ndarray, current_state: np.ndarray
+    rel_actions: np.ndarray,
+    current_state: np.ndarray,
+    action_representation: str = ACTION_REPR_ARM_REL_HAND_REL,
 ) -> np.ndarray:
     """
-    Convert predicted relative 12D actions back to absolute, given the current state.
+    Convert predicted model outputs to absolute 12D actions, given current state.
 
     Args:
-        rel_actions: [T, 12] relative actions (arm SE(3) relative + hand subtraction).
+        rel_actions: [T, 12] model outputs where arm is relative and hand is
+                     interpreted per action_representation.
         current_state: [12,] current absolute state used as reference.
+        action_representation:
+            - arm_rel_hand_rel: hand outputs are relative and shifted by current hand.
+            - arm_rel_hand_abs: hand outputs are already absolute.
 
     Returns:
         [T, 12] absolute actions.
     """
+    action_representation = validate_action_representation(action_representation)
 
     # # we use this in merlin_inference.py in order to get real robot outputs
     # # note that they also have some offset that we DO NOT add here. That is an experimental
@@ -118,7 +153,10 @@ def relative_to_absolute(
         T_target = T_current @ T_rel
         arm_abs[i] = homogeneous_matrix_to_6dof(T_target)
 
-    # # Hand: simple addition
-    hand_abs = hand_rel + current_hand
+    if action_representation == ACTION_REPR_ARM_REL_HAND_REL:
+        # # Hand: simple addition
+        hand_abs = hand_rel + current_hand
+    else:
+        hand_abs = hand_rel
 
     return np.concatenate([arm_abs, hand_abs], axis=-1).astype(np.float32)

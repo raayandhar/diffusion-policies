@@ -28,4 +28,6 @@ dataset:
   # From dataset.py in MERLIN
   first_cut: 0
   encoder_window: 8
+  # arm_rel_hand_rel (default) or arm_rel_hand_abs (EEF relative, hand absolute)
+  action_representation: arm_rel_hand_rel
   use_cache: False
